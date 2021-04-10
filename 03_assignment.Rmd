@@ -1,0 +1,672 @@
+---
+title: 'Assignment #3'
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    df_print: paged
+    code_download: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=FALSE, warning=FALSE)
+options(scipen = 999)
+```
+
+```{r libraries, message=FALSE}
+# SEE modeldata package for new datasets
+library(tidyverse)         # for graphing and data cleaning
+library(tidymodels)        # for modeling
+library(stacks)            # for stacking models
+library(naniar)            # for examining missing values (NAs)
+library(lubridate)         # for date manipulation
+library(moderndive)        # for King County housing data
+library(DALEX)             # for model interpretation  
+library(DALEXtra)          # for extension of DALEX
+library(patchwork)         # for combining plots nicely
+library(grid)
+library(gridExtra)
+library(ggtext)
+library(dbplyr)            # for SQL query "cheating" - part of tidyverse but needs to be loaded separately
+library(mdsr)              # for accessing some databases - goes with Modern Data Science with R textbook
+library(RMySQL)            # for accessing MySQL databases
+library(RSQLite)           # for accessing SQLite databases
+library(kableExtra)
+
+#mapping
+library(maps)              # for built-in maps
+library(sf)                # for making maps using geom_sf
+library(ggthemes)          # Lisa added - I like theme_map() for maps :)
+library(viridis)
+
+#tidytext
+library(tidytext)          # for text analysis, the tidy way!
+library(textdata)          
+library(reshape2)
+library(wordcloud)         # for wordcloud
+library(stopwords)
+
+theme_set(theme_minimal()) # Lisa's favorite theme
+```
+
+When you finish the assignment, remove the `#` from the options chunk at the top, so that messages and warnings aren't printed. If you are getting errors in your code, add `error = TRUE` so that the file knits. I would recommend not removing the `#` until you are completely finished.
+
+## Put it on GitHub!        
+
+From now on, GitHub should be part of your routine when doing assignments. I recommend making it part of your process anytime you are working in R, but I'll make you show it's part of your process for assignments.
+
+**Task**: When you are finished with the assignment, post a link below to the GitHub repo for the assignment. If you want to post it to your personal website, that's ok (not required). Make sure the link goes to a spot in the repo where I can easily find this assignment. For example, if you have a website with a blog and post the assignment as a blog post, link to the post's folder in the repo. As an example, I've linked to my GitHub stacking material [here](https://github.com/llendway/ads_website/tree/master/_posts/2021-03-22-stacking).
+
+https://github.com/thytng/stat494-assignment3
+
+## Local Interpretable Machine Learning
+
+You are going to use the King County house data and the same random forest model to predict `log_price` that I used in the [tutorial](https://advanced-ds-in-r.netlify.app/posts/2021-03-31-imllocal/).
+
+```{r data}
+# Load in the data
+data("house_prices")
+
+# Create log_price and drop price variable
+house_prices <- house_prices %>% 
+  mutate(log_price = log(price, base = 10)) %>% 
+  # make all integers numeric ... fixes prediction problem
+  mutate(across(where(is.integer), as.numeric)) %>% 
+  select(-price)
+```
+
+```{r rf-model, cache=TRUE}
+set.seed(327) #for reproducibility
+
+# Randomly assigns 75% of the data to training.
+house_split <- initial_split(house_prices, 
+                             prop = .75)
+house_training <- training(house_split)
+house_testing <- testing(house_split)
+
+# Set up recipe and transformation steps and roles
+ranger_recipe <- 
+  recipe(formula = log_price ~ ., 
+         data = house_training) %>% 
+  step_date(date, 
+            features = "month") %>% 
+  # Make these evaluative variables, not included in modeling
+  update_role(all_of(c("id",
+                       "date")),
+              new_role = "evaluative")
+
+# Define model
+ranger_spec <- 
+  rand_forest(mtry = 6, 
+              min_n = 10, 
+              trees = 200) %>% 
+  set_mode("regression") %>% 
+  set_engine("ranger")
+
+# Create workflow
+ranger_workflow <- 
+  workflow() %>% 
+  add_recipe(ranger_recipe) %>% 
+  add_model(ranger_spec) 
+
+# Fit the model
+set.seed(712) # for reproducibility - random sampling in random forest choosing number of variables
+ranger_fit <- ranger_workflow %>% 
+  fit(house_training)
+
+# Create an explainer
+rf_explain <- 
+  explain_tidymodels(
+    model = ranger_fit,
+    data = house_training %>% select(-log_price), 
+    y = house_training %>%  pull(log_price),
+    label = "rf"
+  )
+```
+
+**Tasks:**
+
+1. Choose 3 new observations and do the following for each observation:  
+
+```{r}
+obs <- house_testing %>% sample_n(size=3)
+```
+
+  - Construct a break-down plot using the default ordering. Interpret the resulting graph. Which variables contribute most to each observation's prediction?  
+
+```{r breakdown, fig.width=15, fig.height=6, fig.align="center", cache=TRUE}
+for (i in 1:3) {
+  new_obs <- obs %>% slice(i)
+  # Pulls together the data needed for the break-down plot
+  pp_rf <- predict_parts(explainer = rf_explain,
+                         new_observation = new_obs,
+                         type = "break_down")
+  
+  # Break-down plot
+  bnum <- paste("b", i, sep="")
+  b <- plot(pp_rf)
+  assign(bnum, b)
+}
+
+grid.arrange(b1, b2, b3, ncol=3)
+```
+
+**`lat` and `sqft_living` contribute most to each observation's prediction. For the first and second observations, `grade=6` (or 7 since the function somehow transformed this value during the process) is the third most "important" covariates. For the third one, it is `sqft_living15`.**
+
+  - Construct a SHAP graph and interpret it. Does it tell a similar story to the break-down plot?  
+  
+```{r shap, fig.width=15, fig.height=6, fig.align="center", cache=TRUE}
+for (i in 1:3) {
+  new_obs <- obs %>% slice(i)
+  rf_shap <-predict_parts(explainer = rf_explain,
+                          new_observation = new_obs,
+                          type = "shap",
+                          B = 10) 
+  snum <- paste("s", i, sep="")
+  s <- plot(rf_shap)
+  assign(snum, s)
+}
+
+grid.arrange(s1, s2, s3, ncol=3)
+```
+
+**The plots do seem to agree. Once again, `lat` and `sqft_living` come out as the variables with the biggest contribution for all three observations. The plots correctly display `grade=7` as the third most important covariate for the first two. For the third observation, `long` and `sqft_living15` are the third and fourth most important respectively, but in the breakdown plot their order of importance is reversed.**
+
+  - Construct a LIME graph (follow my code carefully). How close is each original prediction to the prediction from the local model? Interpret the result. You can also try using fewer or more variables in the local model than I used in the example.  
+
+```{r lime, fig.width=15, fig.height=6, fig.align="center", cache=TRUE}
+set.seed(646)
+
+preds <- data.frame(model_r2 = double(), model_prediction = double(), prediction = double())
+
+for (i in 1:3) {
+  new_obs <- obs %>% slice(i)
+  
+  model_type.dalex_explainer <- DALEXtra::model_type.dalex_explainer
+  predict_model.dalex_explainer <- DALEXtra::predict_model.dalex_explainer
+  
+  lime_rf <- predict_surrogate(explainer = rf_explain,
+                               new_observation = new_obs %>%
+                                 select(-log_price), 
+                               n_features = 5,
+                               n_permutations = 1000,
+                               type = "lime")
+  preds <- rbind(preds, lime_rf %>% 
+                   select(model_r2, model_prediction, prediction) %>% 
+                   distinct())
+  lnum <- paste("l", i, sep="")
+  l <- plot(lime_rf) +
+    labs(x = "Variable")
+  assign(lnum, l)
+}
+```
+
+**The local predictions are quite close to the originals. The predictions are very close for observation 1, and they differ about .1 and .2 units for the second and third observation respectively. The LIME plots display a similar set of variables that are considered most important for each observation to the ones we saw from the break-down and SHAP plots. Each predictor has a different weight for each observation, meaning that it can have a positive or negative relationship with the response depending on the observation.**
+
+2. Describe how you would use the interpretable machine learning tools we've learned (both local and global) in future machine learning projects? How does each of them help you?
+
+**These tools are excellent for showing how predictors contribute to the model. It is very likely that I will fit models that are more complex than regular linear or logistic regression and in my experience their interpretation is really technical and not intuitive at all. What often happens is that I would have a model and some measure to gauge the predictors' contribution (i.e. coefficient values, variable importance, etc.), but I would have a difficult time translating that to results that I could understand, let alone communicate to a broader audience. Global interpretation tools make it easier to see the relationship between the response and a given covariate and how changing the latter would directly affect the value of the former. With local interpretation tools, I could visualize the contribution of each variable to an individual observation. Ultimately, these tools would help me understand a model and its components better and provide more intuitive and approachable interpretations.**
+
+## SQL
+
+You will use the `airlines` data from the SQL database that I used in the example in the [tutorial](https://advanced-ds-in-r.netlify.app/posts/2021-03-29-sqlinr/). Be sure to include the chunk to connect to the database here. And, when you are finished, disconnect. You may need to reconnect throughout as it times out after a while.
+
+```{r}
+con_air <- dbConnect_scidb("airlines")
+```
+
+**Tasks**:
+
+1. Create a SQL chunk and an equivalent R code chunk that does the following: for each airport (with its name, not code), year, and month find the total number of departing flights, the distinct destinations to which they flew, the average distance of the flight, and the proportion of flights that arrived more than 20 minutes late. In the R code chunk, write this out to a dataset. (HINT: 1. start small! 2. you may want to do the R part first and use it to "cheat" into the SQL code).  
+
+```{sql connection=con_air}
+SELECT
+  name,
+  faa,
+  month, 
+  n_dep_flights,
+  avg_distance,
+  prop_late_over20
+FROM (
+  SELECT 
+    origin, month,
+    COUNT(*) AS n_dep_flights,
+    AVG(distance) AS avg_distance,
+    AVG(arr_delay > 20) AS prop_late_over20
+  FROM flights 
+  WHERE year = 2017
+  GROUP BY origin, month) smry
+INNER JOIN airports AS a
+  ON (smry.origin = a.faa);
+```
+
+```{r}
+airports_smry <- tbl(con_air, "flights") %>%
+  filter(year == 2017) %>%
+  group_by(origin, month) %>%
+  summarize(n_dep_flights = n(),
+            avg_distance = mean(distance),
+            prop_late_over20 = mean(arr_delay > 20)) %>%
+  inner_join(tbl(con_air, "airports") %>%
+               select(name, faa),
+             by = c("origin" = "faa"))
+
+airports_df <- airports_smry %>% 
+  collect()
+
+(airports_df <- airports_df %>%
+    rename(faa = origin) %>%
+    relocate(name, faa))
+```
+
+```{r}
+dbDisconnect(con_air)
+```
+
+  - With the dataset you wrote out, create a graph that helps illustrate the "worst" airports in terms of late arrivals. You have some freedom in how you define worst and you may want to consider some of the other variables you computed. Do some theming to make your graph look glamorous (those of you who weren't in my intro data science class this year may want to watch Will Chase's [Glamour of Graphics](https://www.youtube.com/watch?v=h5cTacaWE6I) talk for inspiration).  
+  
+```{r late-flights, fig.width=8, fig.height=4, fig.align="center"}
+airports_df %>%
+  group_by(name, faa) %>%
+  summarize(
+    lower = quantile(prop_late_over20, .25),
+    upper = quantile(prop_late_over20, .75),
+    med = median(prop_late_over20)) %>%
+  mutate(
+    # this airport's name contains \ characters so I'm removing them to display in the graph
+    name = gsub("\\\\+", "", name)
+    ) %>%
+  filter(med >= .25) %>% 
+  ggplot(aes(y = med,
+             x = fct_reorder(name, med, .desc = TRUE))) +
+  geom_pointrange(aes(ymin = lower, ymax = upper), size = .8, col = "#6388b4") +
+  geom_point(col = "#8cc2ca", size = 2.8) +
+  coord_flip() +
+  labs(title = "Airports with the Highest Proportion of Late Arrivals",
+       subtitle = "<span style='color:#6388b4;'>First</span>, <span style='color:#8cc2ca;'>Second</span>, and <span style='color:#6388b4;'>Third</span> Quartiles of Monthly Proportions, 2017") +
+  theme(plot.title.position = "plot",
+        axis.title = element_blank(),
+        axis.text = element_text(size = 8),
+        title = element_markdown(size = 12),
+        plot.subtitle = element_markdown())
+```
+  
+  - Although your graph was truly inspirational, you've been requested to "boil it down to a few numbers." Some people just don't appreciate all that effort you put in. And, you need to use the already summarized data that you already pulled in from SQL. Create a table with 6 or fewer rows and 3 or fewer columns that summarizes which airport is the "worst" in terms of late arrivals. Be careful with your calculations. You may consider using the `kable`, `kableExtra`, or `gt` packages to make your table look truly spectacular.
+  
+```{r}
+airports_df %>%
+  group_by(name) %>%
+  summarize(
+    avg_flights = mean(n_dep_flights),
+    avg_prop_late = mean(prop_late_over20)
+  ) %>%
+  arrange(desc(avg_prop_late)) %>%
+  head(6) %>%
+  mutate(
+  name = gsub("\\\\+", "", name)
+  ) %>%
+  kable(
+    digits = 3,
+    caption = "Airports with the Highest Proportion of Late Arrivals, 2017",
+    col.names = c("Airport", "Number of Departing Flights", "Proportion of Late Arrivals"),
+    align = c("l", "c", "c")
+  ) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover")
+  ) %>%
+  row_spec(1, bold = T) %>%
+  add_footnote("Numbers are monthly averages.", notation = "none")
+```
+
+  
+2. Come up with your own interesting question that data in the airlines database can help you answer. Write a SQL query and equivalent R code chunk to extract the data you need and create an elegant graph to help answer the question. Be sure to write down the question so it is clear. 
+
+**What are the busiest airports in terms of departures and for each of them, what is its most popular destination?**
+
+```{r}
+con_air <- dbConnect_scidb("airlines")
+```
+
+```{sql connection=con_air}
+SELECT
+  origin_faa,
+  origin_name,
+  dest_faa,
+  dest_name,
+  n_flights
+FROM (
+  SELECT
+    origin, 
+    dest,
+    COUNT(*) AS n_flights
+  FROM flights
+  GROUP BY origin, dest) smry
+  INNER JOIN (SELECT faa AS origin_faa, name AS origin_name FROM airports) AS a
+    ON (smry.origin = a.origin_faa)
+  INNER JOIN (SELECT faa AS dest_faa, name AS dest_name FROM airports) AS b
+    ON (smry.dest = b.dest_faa)
+```
+
+```{r}
+airports_connect <- tbl(con_air, "flights") %>%
+  group_by(origin, dest) %>%
+  summarize(n_flights = n()) %>%
+  inner_join(tbl(con_air, "airports") %>%
+               rename(origin_name = name) %>%
+               select(origin_name, faa),
+             by = c("origin" = "faa")) %>%
+  inner_join(tbl(con_air, "airports") %>%
+               rename(dest_name = name) %>%
+               select(dest_name, faa),
+             by = c("dest" = "faa")) %>%
+  select(origin, origin_name, dest, dest_name, n_flights)
+
+(airports_connections <- airports_connect %>%
+    collect())
+```
+```{r}
+dbDisconnect(con_air)
+```
+
+```{r airport-connections, fig.width=8, fig.height=4, fig.align="center"}
+airports_connections %>%
+  group_by(origin, origin_name) %>%
+  summarize(max_flights = max(n_flights),
+            rem_flights = sum(n_flights) - max_flights) %>%
+  inner_join(airports_connections %>%
+               select(origin, dest, dest_name, n_flights), 
+             by = c("origin" = "origin", "max_flights" = "n_flights")) %>%
+  # slice_max(max_flights, n = 10) ## this doesn't work for some reason...
+  arrange(desc(max_flights + rem_flights)) %>%
+  head(10) %>%
+  pivot_longer(ends_with("flights"), values_to = "n_flights", names_to = "type") %>%
+  mutate(dest = ifelse(type == "max_flights", dest, "Rem.")) %>%
+  mutate(dest = fct_relevel(dest, "Rem.")) %>%
+  group_by(origin) %>%
+  mutate(tot_flights = sum(n_flights)) %>%
+  filter(dest != "Rem") %>%
+  ggplot(aes(x = n_flights, y = fct_reorder(origin_name, n_flights), fill = dest)) +
+  geom_col(position = position_stack(reverse = TRUE), col = "white") +
+  geom_text(data = . %>% 
+              filter(dest != "Rem.") %>%
+              ungroup() %>%
+              distinct(dest_name,
+                       .keep_all = TRUE), 
+            aes(label = dest_name, x = tot_flights), 
+            size = 3, 
+            hjust = -.1) +
+  scale_fill_tableau(palette = "Superfishel Stone", direction = 1) + 
+  labs(title = "Top 10 Busiest Airports in Terms of Departing Flights",
+       subtitle = "Number of Total Departures to <span style='color:#6388b4;'>Other Airports</span> and to Most Popular Destination") +
+  theme(axis.title = element_blank(),
+        axis.text.x = element_text(vjust = -.5),
+        plot.title.position = "plot",
+        plot.subtitle = element_markdown(),
+        legend.position = "none",
+        panel.grid = element_blank()) +
+  xlim(0, 3500000)
+```
+
+## Function Friday
+
+If you need to revisit the material, it is posted on the moodle page. I've tried to add all the necessary libraries to the top, but I may have missed something.
+
+**`geom_sf()` tasks**:
+
+Using the example from class that we presented as a baseline (or your own if you really want to be ambitious), try to add the following components to the map of the contiguous United States:
+
+1.	Change the color scheme of the map from the default blue (one option could be viridis).
+2.	Add a dot (or any symbol you want) to the centroid of each state.
+3.	Add a layer onto the map with the counties.
+4.	Change the coordinates of the map to zoom in on your favorite state.
+
+Hint: https://www.r-spatial.org/r/2018/10/25/ggplot2-sf-2.html is a useful reference for some of the questions
+
+```{r}
+states <- st_as_sf(maps::map("state", 
+                             plot = FALSE, 
+                             fill = TRUE))
+states <- states %>%
+  mutate(area = as.numeric(st_area(states)))
+
+# create centroid
+states <- cbind(states, st_coordinates(st_centroid(states)))
+
+# join state names to state abbreviations for mapping
+data(state)
+states <- states %>%
+  inner_join(data.frame(name = tolower(state.name),
+                        abb = state.abb),
+             by = c("ID" = "name"))
+
+# get counties
+counties <- st_as_sf(map("county", plot = FALSE, fill = TRUE))
+counties$area <- as.numeric(st_area(counties))
+```
+
+```{r fig.width=8, fig.height=4, fig.align="center"}
+ggplot(data = states) +
+  geom_sf(aes(fill = area)) +
+  geom_sf(data = counties, fill = NA, color = "darkgrey", size = .1) +
+  geom_text(data = states, aes(X, Y, label = abb), size = 3) +
+  coord_sf(xlim = c(-127, -63), 
+           ylim = c(24, 51), 
+           expand = FALSE) +
+  theme_map() +
+  scale_fill_viridis_c(alpha = .8, direction = -1) +
+  labs(fill = "Area") +
+  theme(legend.position = c(.85, 0))
+```
+
+```{r fig.width=8, fig.height=4, fig.align="center"}
+ggplot(data = states) +
+  geom_sf(aes(fill = area)) +
+  geom_sf(data = counties, fill = NA, color = "darkgrey", size = .1) +
+  geom_text(data = states %>% filter(abb == "MN"), aes(X, Y, label = abb), size = 5) +
+  coord_sf(xlim = c(-98, -89), 
+           ylim = c(43, 50), 
+           expand = FALSE) +
+  theme_map() +
+  scale_fill_viridis_c(alpha = .8, direction = -1) +
+  labs(fill = "Area") +
+  theme(legend.position = c(1.1, 0))
+```
+
+**`tidytext` tasks**:
+
+Now you will try using tidytext on a new dataset about Russian Troll tweets.
+
+#### Read about the data
+
+These are tweets from Twitter handles that are connected to the Internet Research Agency (IRA), a Russian "troll factory."  The majority of these tweets were posted from 2015-2017, but the datasets encompass tweets from February 2012 to May 2018.
+
+Three of the main categories of troll tweet that we will be focusing on are Left Trolls, Right Trolls, and News Feed.  **Left Trolls** usually pretend to be BLM activists, aiming to divide the democratic party (in this context, being pro-Bernie so that votes are taken away from Hillary).  **Right trolls** imitate Trump supporters, and **News Feed** handles are "local news aggregators," typically linking to legitimate news.
+
+For our upcoming analyses, some important variables are:
+
+  * **author** (handle sending the tweet)
+  * **content** (text of the tweet)
+  * **language** (language of the tweet)
+  * **publish_date** (date and time the tweet was sent)
+
+Variable documentation can be found on [Github](https://github.com/fivethirtyeight/russian-troll-tweets/) and a more detailed description of the dataset can be found in this [fivethirtyeight article](https://fivethirtyeight.com/features/why-were-sharing-3-million-russian-troll-tweets/).
+
+Because there are 12 datasets containing 2,973,371 tweets sent by 2,848 Twitter handles in total, we will be using three of these datasets (one from a Right troll, one from a Left troll, and one from a News Feed account).
+
+\
+\
+
+1. Read in Troll Tweets Dataset - this takes a while. You can cache it so you don't need to read it in again each time you knit. Be sure to remove the `eval=FALSE`!!!!
+
+```{r, cache=TRUE}
+troll_tweets <- read_csv("https://raw.githubusercontent.com/fivethirtyeight/russian-troll-tweets/master/IRAhandle_tweets_12.csv")
+```
+
+2. Basic Data Cleaning and Exploration
+
+  a. Remove rows where the tweet was in a language other than English
+
+```{r}
+troll_tweets_mod <- troll_tweets %>%
+  filter(language == "English")
+```
+
+  b. Report the dimensions of the dataset
+
+```{r}
+dim(troll_tweets_mod)
+```
+  
+  c. Create two or three basic exploratory plots of the data (ex. plot of the different locations from which tweets were posted, plot of the account category of a tweet)
+  
+```{r fig.width=12, fig.height=6, fig.align="center"}
+g1 <- troll_tweets_mod %>%
+  group_by(region) %>%
+  summarize(n = n()) %>%
+  drop_na() %>%
+  ggplot(aes(x = n,
+             y = fct_reorder(region, n, .desc = TRUE))) +
+  geom_col(fill = "lightblue") +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        title = element_text(size = 11),
+        plot.title.position = "plot",
+        panel.grid = element_blank()) +
+  scale_x_log10() +
+  labs(title = "Number of Tweets by Region")
+
+g2 <- troll_tweets_mod %>%
+  group_by(account_category) %>%
+  summarize(n = n()) %>%
+  ggplot(aes(x = n,
+             y = fct_reorder(account_category, n, .desc = TRUE))) +
+  geom_col(fill = "lightblue") +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        plot.title.position = "plot",
+        title = element_text(size = 11),
+        panel.grid = element_blank()) +
+  labs(title = "Number of Tweets by Account Category")
+
+grid.arrange(g1, g2, ncol = 2)
+```
+
+
+3. Unnest Tokens
+
+We want each row to represent a word from a tweet, rather than an entire tweet. Be sure to remove the `eval=FALSE`!!!!
+
+```{r}
+(troll_tweets_untoken <- troll_tweets_mod %>%
+   unnest_tokens(output = word, input = content))
+```
+
+4. Remove stopwords. Be sure to remove the `eval=FALSE`!!!!
+
+```{r}
+# get rid of stopwords (the, and, etc.)
+troll_tweets_cleaned <- troll_tweets_untoken %>%
+  anti_join(stop_words)
+```
+
+Take a look at the troll_tweets_cleaned dataset.  Are there any other words/letters/numbers that we want to eliminate that weren't taken care of by stop_words? Be sure to remove the `eval=FALSE`!!!!
+
+```{r}
+troll_tweets_cleaned %>%
+  count(word, name = "count") %>%
+  arrange(desc(count))
+```
+
+```{r}
+# get rid of http, https, t.co, rt, amp, single number digits, and singular letters
+troll_tweets_cleaned <- troll_tweets_cleaned %>%
+  filter(!(word %in% c("http", "https", "t.co", "rt", "amp"))) %>%
+  filter(nchar(word) > 1)
+```
+
+
+5. Look at a subset of the tweets to see how often the top words appear.
+
+```{r}
+troll_tweets_small <- troll_tweets_cleaned %>%
+  count(word) %>%
+  slice_max(order_by = n, n = 50) # 50 most occurring words
+
+# visualize the number of times the 50 top words appear
+ggplot(troll_tweets_small, 
+       aes(y = fct_reorder(word,n), x = n)) +
+  geom_col() +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        plot.title.position = "plot") +
+  labs(title = "Number of Times the Top 50 Most Common Words Appeared")
+```
+
+
+6. Sentiment Analysis
+
+  a. Get the sentiments using the "bing" parameter (which classifies words into "positive" or "negative")
+  
+```{r}
+# Sentiments 
+sentiments <- get_sentiments("bing")
+```
+
+  b. Report how many positive and negative words there are in the dataset.  Are there more positive or negative words, and why do you think this might be?
+  
+Be sure to remove the `eval=FALSE`!!!!
+
+```{r}
+# assign a sentiment to each word that has one associated
+troll_tweets_sentiment <- troll_tweets_cleaned %>%
+  inner_join(sentiments)
+
+# count the sentiments
+troll_tweets_sentiment %>% 
+  count(sentiment)
+```
+
+**There are more negative words. If the trolls were, well, trolling then they must have tried to be as polarizing as possible and therefore their tweets were loaded with more negative sentiments.**
+
+7. Using the troll_tweets_small dataset, make a wordcloud:
+
+  a. That is sized by the number of times that a word appears in the tweets
+  
+```{r}
+# make a wordcloud where the size of the word is based on the number of times the word appears across the tweets
+troll_tweets_small %>%
+  with(wordcloud(word, n))
+```
+
+  b. That is colored by sentiment (positive or negative)
+
+```{r}
+# make a wordcloud colored by sentiment
+troll_tweets_sentiment %>%
+  count(word, sentiment, sort = TRUE) %>%
+  acast(word ~ sentiment, value.var = "n", fill = 0) %>%
+  comparison.cloud(colors = c("red", "green"),
+                   max.words = 50)
+```
+
+Are there any words whose categorization as "positive" or "negative" surprised you?
+
+**Well aside for the big green "trump" word in the middle of the wordcloud, I'm not really surprised by the results. Technically the word does have a positive meaning, but in the context of things it is kinda funny and sad at the same time.**
+
+## Projects
+
+Read the project description on the moodle page. Talk to your group members about potential topics. 
+
+**Task:**
+
+Write a short paragraph about ideas you have. If you already have some data sources in mind, you can link to those, but I'm more concerned with you having a topic that you're interested in investigating right now. 
+
+**Our group has narrowed down to two broad ideas: K-12 computer science education and mental health resources. We're interested in the availability and maybe quality of each so the project might lean more towards visualization as opposed to modeling depending on the data we acquire. We'll also branch out during our individual data search and are still open to ideas if we come across interesting data that are related to CS education or mental health.**
+
+## "Undoing" bias
+
+**Task:**
+
+Read this tweet [thread](https://threadreaderapp.com/thread/1375957284061376516.html) by [Deb Raji](https://en.wikipedia.org/wiki/Deborah_Raji) who you may remember from the *Coded Bias* film. Write a short paragraph that discusses at least one of the misconceptions.
+
+**I think the last misconception really drives home the nuance and challenge of addressing and tackling bias in algorithms. First off the problem itself is hard to identify. Racial and gender biases are so ingrained and bleed into many different variables (that pertain to socio-economic status, for example), that even when the algorithms don't explicitly include race and gender as covariates, such biases will still be present. Although we can test the system on various populations and compare its accuracy and fairness, it would be hard to pinpoint exactly where bias was introduced, let alone address it. As Deb Raji pointed out at the beginning, biases can arise at any point and by any design decision. This not only makes them obscure and hard to detect but also naturally leads to the possibility of introducing other biases when people try to "fix" the issues. Therefore, the challenge of creating and framing inventions is made harder as there is no definitive point where people can stop and conclude that the system is completely reliable or fair. If we did frame them as such, then we'd fall back into the trap of blindly using it without further question or evaluation. Ultimately these systems can never be flawless and as we collect more data and as society progresses, they need to be constantly monitored to ensure that their use and results are still appropriate and applicable to the target population.**
